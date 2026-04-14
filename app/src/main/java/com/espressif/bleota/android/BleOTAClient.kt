@@ -2,16 +2,14 @@ package com.espressif.bleota.android
 
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothGatt
-import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
-import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothGattService
 import android.content.Context
 import android.util.Log
 import com.espressif.bleota.android.message.BleOTAMessage
 import com.espressif.bleota.android.message.EndCommandAckMessage
 import com.espressif.bleota.android.message.StartCommandAckMessage
+import no.nordicsemi.android.ble.observer.ConnectionObserver
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.Closeable
@@ -23,11 +21,14 @@ import kotlin.concurrent.thread
 class BleOTAClient(
     private val context: Context,
     private val device: BluetoothDevice,
-    private val bin: ByteArray
+    private val bin: ByteArray,
 ) : Closeable {
+
+    private val manager = EspBleOtaBleManager(context, this)
+
     companion object {
-        private const val TAG = "BleOTAClient"
-        private const val DEBUG = false
+        internal const val TAG = "BleOTAClient"
+        internal const val DEBUG = false
 
         private const val COMMAND_ID_START = 0x0001
         private const val COMMAND_ID_END = 0x0002
@@ -41,34 +42,38 @@ class BleOTAClient(
         private const val BIN_ACK_SECTOR_INDEX_ERROR = 0x0002
         private const val BIN_ACK_PAYLOAD_LENGTH_ERROR = 0x0003
 
-        private const val MTU_SIZE = 500
-        private const val MTU_STATUS_FAILED = 20000
+        internal const val MTU_SIZE = 500
         private const val EXPECT_PACKET_SIZE = 463
 
-        private val SERVICE_UUID = bleUUID("8018")
-        private val CHAR_RECV_FW_UUID = bleUUID("8020")
-        private val CHAR_PROGRESS_UUID = bleUUID("8021")
-        private val CHAR_COMMAND_UUID = bleUUID("8022")
-        private val CHAR_CUSTOMER_UUID = bleUUID("8023")
+        internal val SERVICE_UUID = bleUUID("8018")
+        internal val CHAR_RECV_FW_UUID = bleUUID("8020")
+        internal val CHAR_PROGRESS_UUID = bleUUID("8021")
+        internal val CHAR_COMMAND_UUID = bleUUID("8022")
+        internal val CHAR_CUSTOMER_UUID = bleUUID("8023")
 
         private const val REQUIRE_CHECKSUM = false
+
+        /** Max sectors sent ahead without receiving per-sector notify ACK. This value should be modified. */
+        private const val SECTOR_SEND_WINDOW = 3
+
+        internal fun bleDebugLog(): Boolean = DEBUG
     }
 
     var packetSize = 20
 
-    var gatt: BluetoothGatt? = null
     var service: BluetoothGattService? = null
     var recvFwChar: BluetoothGattCharacteristic? = null
     var progressChar: BluetoothGattCharacteristic? = null
     var commandChar: BluetoothGattCharacteristic? = null
     var customerChar: BluetoothGattCharacteristic? = null
 
-    private var nextNotifyChar: BluetoothGattCharacteristic? = null
-
     private var callback: GattCallback? = null
     private val packets = LinkedList<ByteArray>()
     private val sectorAckIndex = AtomicInteger(0)
     private val sectorAckMark = ByteArray(0)
+
+    /** Sectors fully written (past [sectorAckMark]) but not yet released by BIN_ACK_SUCCESS. */
+    private var sectorsInFlight: Int = 0
 
     fun connect(callback: GattCallback) {
         Log.i(TAG, "start OTA")
@@ -76,15 +81,20 @@ class BleOTAClient(
 
         this.callback = callback
         callback.client = this
-        gatt = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
+        manager.connectWithObserver(device, callback)
     }
 
     fun stop() {
-        gatt?.close()
-        gatt = null
+        manager.shutdown()
         callback = null
 
+        sectorsInFlight = 0
         packets.clear()
+        service = null
+        recvFwChar = null
+        progressChar = null
+        commandChar = null
+        customerChar = null
     }
 
     override fun close() {
@@ -92,11 +102,42 @@ class BleOTAClient(
     }
 
     fun ota() {
-        notifyNextDescWrite()
+        manager.enqueueEnableNotificationsThen { postCommandStart() }
+    }
+
+    internal fun onGattServicesResolved(
+        svc: BluetoothGattService?,
+        recv: BluetoothGattCharacteristic?,
+        progress: BluetoothGattCharacteristic?,
+        command: BluetoothGattCharacteristic?,
+        customer: BluetoothGattCharacteristic?,
+    ) {
+        service = svc
+        recvFwChar = recv
+        progressChar = progress
+        commandChar = command
+        customerChar = customer
+    }
+
+    internal fun onGattServicesInvalidated() {
+        service = null
+        recvFwChar = null
+        progressChar = null
+        commandChar = null
+        customerChar = null
+    }
+
+    internal fun applyNegotiatedMtu(mtu: Int) {
+        packetSize = if (mtu > 200) EXPECT_PACKET_SIZE else 20
+    }
+
+    internal fun notifyMtuNegotiated(mtu: Int, success: Boolean) {
+        callback?.onMtuNegotiated(mtu, success)
     }
 
     private fun initPackets() {
         sectorAckIndex.set(0)
+        sectorsInFlight = 0
         packets.clear()
 
         val sectors = ArrayList<ByteArray>()
@@ -157,38 +198,6 @@ class BleOTAClient(
         }
     }
 
-    private fun notifyNextDescWrite(): BluetoothGattCharacteristic? {
-        return when (nextNotifyChar) {
-            null -> {
-                nextNotifyChar = recvFwChar
-                recvFwChar
-            }
-            recvFwChar -> {
-                nextNotifyChar = progressChar
-                progressChar
-            }
-            progressChar -> {
-                nextNotifyChar = commandChar
-                commandChar
-            }
-            commandChar -> {
-                nextNotifyChar = customerChar
-                customerChar
-            }
-            customerChar -> {
-                null
-            }
-            else -> {
-                null
-            }
-        }?.apply {
-            getDescriptor(UUID_NOTIFY_DESCRIPTOR)?.apply {
-                value = BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
-                gatt?.writeDescriptor(this)
-            }
-        }
-    }
-
     private fun genCommandPacket(id: Int, payload: ByteArray): ByteArray {
         val packet = ByteArray(20)
         packet[0] = (id and 0xff).toByte()
@@ -210,8 +219,7 @@ class BleOTAClient(
             (binSize shr 24 and 0xff).toByte(),
         )
         val packet = genCommandPacket(COMMAND_ID_START, payload)
-        commandChar?.value = packet
-        gatt?.writeCharacteristic(commandChar)
+        manager.enqueueCommandWrite(packet)
     }
 
     private fun receiveCommandStartAck(status: Int) {
@@ -230,8 +238,7 @@ class BleOTAClient(
         Log.i(TAG, "postCommandEnd")
         val payload = ByteArray(0)
         val packet = genCommandPacket(COMMAND_ID_END, payload)
-        commandChar?.value = packet
-        gatt?.writeCharacteristic(commandChar)
+        manager.enqueueCommandWrite(packet)
     }
 
     private fun receiveCommandEndAck(status: Int) {
@@ -248,7 +255,6 @@ class BleOTAClient(
     private fun postBinData() {
         thread {
             initPackets()
-
             postNextPacket()
         }
     }
@@ -256,32 +262,62 @@ class BleOTAClient(
     private fun postNextPacket() {
         val packet = packets.pollFirst()
         if (packet == null) {
-            postCommandEnd()
-        } else if (packet === sectorAckMark) {
-            if (DEBUG) {
-                Log.d(TAG, "postNextPacket: wait for sector ACK")
+            if (sectorsInFlight == 0) {
+                postCommandEnd()
             }
-        } else {
-            recvFwChar?.value = packet
-            gatt?.writeCharacteristic(recvFwChar)
+            return
         }
+        if (packet === sectorAckMark) {
+            sectorsInFlight++
+            if (DEBUG) {
+                Log.d(TAG, "postNextPacket: sector sent, sectorsInFlight=$sectorsInFlight")
+            }
+            val hasMore = packets.isNotEmpty()
+            if (hasMore) {
+                if (DEBUG) {
+                    Log.d(TAG, "postNextPacket: has more packets, sectorsInFlight=$sectorsInFlight")
+                }
+                if (sectorsInFlight < SECTOR_SEND_WINDOW) {
+                    postNextPacket()
+                } else {
+                    Log.d(TAG, "postNextPacket: sectors in flight >= SECTOR_SEND_WINDOW, wait for ACK")
+                }
+            }
+            return
+        }
+        if (DEBUG) {
+            val len = minOf(packet.size, 40)
+            val hexString = packet.take(len).joinToString(" ") { "%02X".format(it) }
+            Log.d(TAG, "postNextPacket: enqueue FW write: [$hexString] (len=${packet.size})")
+        }
+
+        manager.enqueueFirmwarePacket(
+            data = packet,
+            onComplete = { postNextPacket() },
+            onFailRequeue = { packets.offerFirst(packet) },
+        )
     }
 
-    private fun parseSectorAck(data: ByteArray) {
+    internal fun parseSectorAck(data: ByteArray) {
         try {
             val expectIndex = sectorAckIndex.getAndIncrement()
             val ackIndex = (data[0].toInt() and 0xff) or
-                    (data[1].toInt() shl 8 and 0xff00)
+                (data[1].toInt() shl 8 and 0xff00)
             if (ackIndex != expectIndex) {
                 Log.w(TAG, "takeSectorAck: Receive error index $ackIndex, expect $expectIndex")
                 callback?.onError(1)
                 return
             }
             val ackStatus = (data[2].toInt() and 0xff) or
-                    (data[3].toInt() shl 8 and 0xff00)
+                (data[3].toInt() shl 8 and 0xff00)
             Log.d(TAG, "takeSectorAck: index=$ackIndex, status=$ackStatus")
             when (ackStatus) {
                 BIN_ACK_SUCCESS -> {
+                    sectorsInFlight--
+                    if (sectorsInFlight < 0) {
+                        Log.w(TAG, "parseSectorAck: sectorsInFlight underflow, clamping to 0")
+                        sectorsInFlight = 0
+                    }
                     postNextPacket()
                 }
                 BIN_ACK_CRC_ERROR -> {
@@ -290,7 +326,7 @@ class BleOTAClient(
                 }
                 BIN_ACK_SECTOR_INDEX_ERROR -> {
                     val devExpectIndex = (data[4].toInt() and 0xff) or
-                            (data[5].toInt() shl 8 and 0xff00)
+                        (data[5].toInt() shl 8 and 0xff00)
                     if (DEBUG) {
                         Log.w(TAG, "parseSectorAck: device expect index = $devExpectIndex")
                     }
@@ -315,8 +351,7 @@ class BleOTAClient(
         }
     }
 
-    private fun parseCommandPacket() {
-        val packet = commandChar!!.value
+    internal fun parseCommandPacketValue(packet: ByteArray) {
         if (DEBUG) {
             Log.i(TAG, "parseCommandPacket: ${packet.contentToString()}")
         }
@@ -332,9 +367,9 @@ class BleOTAClient(
         val id = (packet[0].toInt() and 0xff) or (packet[1].toInt() shl 8 and 0xff00)
         if (id == COMMAND_ID_ACK) {
             val ackId = (packet[2].toInt() and 0xff) or
-                    (packet[3].toInt() shl 8 and 0xff00)
+                (packet[3].toInt() shl 8 and 0xff00)
             val ackStatus = (packet[4].toInt() and 0xff) or
-                    (packet[5].toInt() shl 8 and 0xff00)
+                (packet[5].toInt() shl 8 and 0xff00)
             when (ackId) {
                 COMMAND_ID_START -> {
                     receiveCommandStartAck(ackStatus)
@@ -346,120 +381,26 @@ class BleOTAClient(
         }
     }
 
-    open class GattCallback : BluetoothGattCallback() {
+    open class GattCallback : ConnectionObserver {
         var client: BleOTAClient? = null
 
-        protected fun isGattSuccess(status: Int): Boolean {
-            return status == BluetoothGatt.GATT_SUCCESS
-        }
+        override fun onDeviceConnecting(device: BluetoothDevice) {}
 
-        protected fun isGattFailed(status: Int): Boolean {
-            return status != BluetoothGatt.GATT_SUCCESS
-        }
+        override fun onDeviceConnected(device: BluetoothDevice) {}
 
-        open fun onError(code: Int) {
-        }
+        override fun onDeviceFailedToConnect(device: BluetoothDevice, reason: Int) {}
 
-        open fun onOTA(message: BleOTAMessage) {
-        }
+        override fun onDeviceReady(device: BluetoothDevice) {}
 
-        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            when (newState) {
-                BluetoothGatt.STATE_CONNECTED -> {
-                    gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
-                    if (!gatt.requestMtu(MTU_SIZE)) {
-                        onMtuChanged(gatt, MTU_SIZE, MTU_STATUS_FAILED)
-                    }
-                }
-            }
-        }
+        override fun onDeviceDisconnecting(device: BluetoothDevice) {}
 
-        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-            client!!.packetSize = if (isGattSuccess(status)) EXPECT_PACKET_SIZE else 20
-            gatt.discoverServices()
-        }
+        override fun onDeviceDisconnected(device: BluetoothDevice, reason: Int) {}
 
-        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            if (isGattFailed(status)) {
-                return
-            }
+        /** Called after MTU negotiation during initialization ([success] reflects request outcome). */
+        open fun onMtuNegotiated(mtu: Int, success: Boolean) {}
 
-            val service = gatt.getService(SERVICE_UUID)
-            val recvFwChar = service?.getCharacteristic(CHAR_RECV_FW_UUID)?.also {
-                gatt.setCharacteristicNotification(it, true)
-            }
-            val progressChar = service?.getCharacteristic(CHAR_PROGRESS_UUID)?.also {
-                gatt.setCharacteristicNotification(it, true)
-            }
-            val commandChar = service.getCharacteristic(CHAR_COMMAND_UUID)?.also {
-                gatt.setCharacteristicNotification(it, true)
-            }
-            val customerChar = service?.getCharacteristic(CHAR_CUSTOMER_UUID)?.also {
-                gatt.setCharacteristicNotification(it, true)
-            }
+        open fun onError(code: Int) {}
 
-            client?.also {
-                it.service = service
-                it.recvFwChar = recvFwChar
-                it.progressChar = progressChar
-                it.commandChar = commandChar
-                it.customerChar = customerChar
-            }
-        }
-
-        override fun onDescriptorWrite(
-            gatt: BluetoothGatt,
-            descriptor: BluetoothGattDescriptor,
-            status: Int
-        ) {
-            if (isGattFailed(status)) {
-                return
-            }
-
-            val next = client?.notifyNextDescWrite()
-            if (next == null) {
-                // Set notification enabled completed
-                Log.d(TAG, "onDescriptorWrite: Set notification enabled completed")
-                client?.postCommandStart()
-            }
-        }
-
-        override fun onCharacteristicWrite(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            status: Int
-        ) {
-            if (DEBUG) {
-                Log.d(TAG, "onCharacteristicWrite: status=$status, char=${characteristic.uuid}")
-            }
-            if (characteristic == client?.recvFwChar) {
-                client?.postNextPacket()
-            }
-            if (isGattFailed(status)) {
-                Log.w(TAG, "onCharacteristicWrite: status=$status")
-                return
-            }
-        }
-
-        override fun onCharacteristicChanged(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic
-        ) {
-            if (DEBUG) {
-                Log.d(TAG, "onCharacteristicChanged: char=${characteristic.uuid}")
-            }
-            when (characteristic) {
-                client?.recvFwChar -> {
-                    client?.parseSectorAck(characteristic.value)
-                }
-                client?.progressChar -> {
-                }
-                client?.commandChar -> {
-                    client?.parseCommandPacket()
-                }
-                client?.customerChar -> {
-                }
-            }
-        }
+        open fun onOTA(message: BleOTAMessage) {}
     }
 }

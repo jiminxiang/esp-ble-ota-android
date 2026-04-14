@@ -1,8 +1,6 @@
 package com.espressif.bleota.android
 
-import android.bluetooth.BluetoothGatt
-import android.bluetooth.BluetoothGattCharacteristic
-import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothDevice
 import android.bluetooth.le.ScanResult
 import android.net.Uri
 import android.os.Build
@@ -21,6 +19,7 @@ import com.espressif.bleota.android.message.EndCommandAckMessage
 import com.espressif.bleota.android.message.StartCommandAckMessage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import no.nordicsemi.android.ble.observer.ConnectionObserver
 
 class BleOTAActivity : AppCompatActivity() {
     companion object {
@@ -46,7 +45,9 @@ class BleOTAActivity : AppCompatActivity() {
             mScanResult = intent.getParcelableExtra(BleOTAConstants.KEY_SCAN_RESULT, ScanResult::class.java)!!
             mBinUri = intent.getParcelableExtra(BleOTAConstants.KEY_BIN_URI, Uri::class.java)!!
         } else {
+            @Suppress("DEPRECATION")
             mScanResult = intent.getParcelableExtra(BleOTAConstants.KEY_SCAN_RESULT)!!
+            @Suppress("DEPRECATION")
             mBinUri = intent.getParcelableExtra(BleOTAConstants.KEY_BIN_URI)!!
         }
 
@@ -129,42 +130,40 @@ class BleOTAActivity : AppCompatActivity() {
         override fun getItemCount(): Int {
             return mStatusList.size
         }
-
     }
 
     private inner class GattCallback : BleOTAClient.GattCallback() {
 
-        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            super.onConnectionStateChange(gatt, status, newState)
-            when {
-                isGattFailed(status) -> {
-                    updateStatus("Status error: $status", false)
-                }
-                newState == BluetoothGatt.STATE_DISCONNECTED -> {
-                    updateStatus("Disconnected", false)
-                }
-                newState == BluetoothGatt.STATE_CONNECTED -> {
-                    updateStatus("Connected", true)
-                }
-            }
+        override fun onDeviceFailedToConnect(device: BluetoothDevice, reason: Int) {
+            updateStatus("Connect failed, reason=$reason", false)
         }
 
-        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-            super.onMtuChanged(gatt, mtu, status)
-            val result = if (isGattSuccess(status)) {
+        override fun onDeviceConnected(device: BluetoothDevice) {
+            updateStatus("Connected", true)
+        }
+
+        override fun onDeviceDisconnected(device: BluetoothDevice, reason: Int) {
+            val human = when (reason) {
+                ConnectionObserver.REASON_SUCCESS -> "local disconnect"
+                ConnectionObserver.REASON_TERMINATE_PEER_USER -> "peer disconnected"
+                ConnectionObserver.REASON_LINK_LOSS -> "link loss"
+                ConnectionObserver.REASON_NOT_SUPPORTED -> "service not supported"
+                ConnectionObserver.REASON_TIMEOUT -> "timeout"
+                else -> "reason=$reason"
+            }
+            updateStatus("Disconnected ($human)", false)
+        }
+
+        override fun onMtuNegotiated(mtu: Int, success: Boolean) {
+            val result = if (success) {
                 "success"
             } else {
-                "failed, status=$status"
+                "failed"
             }
             updateStatus("Request MTU $mtu $result", true)
         }
 
-        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            super.onServicesDiscovered(gatt, status)
-            if (isGattFailed(status)) {
-                updateStatus("Discover services failed, status=$status", false)
-                return
-            }
+        override fun onDeviceReady(device: BluetoothDevice) {
             if (mOtaClient?.service == null) {
                 updateStatus("Discover service failed", false)
                 return
@@ -187,32 +186,6 @@ class BleOTAActivity : AppCompatActivity() {
             }
 
             updateStatus("Discover service and char completed", true, false)
-        }
-
-        override fun onDescriptorWrite(
-            gatt: BluetoothGatt,
-            descriptor: BluetoothGattDescriptor,
-            status: Int
-        ) {
-            super.onDescriptorWrite(gatt, descriptor, status)
-            if (isGattFailed(status)) {
-                updateStatus(
-                    "Set notification enabled failed, status=$status, char=${descriptor.characteristic.uuid}",
-                    false
-                )
-                return
-            }
-        }
-
-        override fun onCharacteristicWrite(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            status: Int
-        ) {
-            super.onCharacteristicWrite(gatt, characteristic, status)
-            if (isGattFailed(status)) {
-                updateStatus("CharacteristicWrite failed, status=$status", false)
-            }
         }
 
         override fun onOTA(message: BleOTAMessage) {

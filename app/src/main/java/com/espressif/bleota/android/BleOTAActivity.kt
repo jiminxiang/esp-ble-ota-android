@@ -8,6 +8,7 @@ import android.bluetooth.le.ScanResult
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Log
 import android.view.View
 import android.view.ViewGroup
@@ -23,6 +24,7 @@ import com.espressif.bleota.android.message.StartCommandAckMessage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import no.nordicsemi.android.ble.observer.ConnectionObserver
+import java.util.Locale
 
 class BleOTAActivity : AppCompatActivity() {
     companion object {
@@ -39,6 +41,9 @@ class BleOTAActivity : AppCompatActivity() {
     private var mOtaClient: BleOTAClient? = null
 
     private val mStatusList = ArrayList<String>()
+
+    /** [SystemClock.elapsedRealtime] when START ACK accept began payload transfer; 0 if not started. */
+    private var mOtaXferStartElapsedMs: Long = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -77,6 +82,7 @@ class BleOTAActivity : AppCompatActivity() {
 
     private fun connect() {
         close()
+        mOtaXferStartElapsedMs = 0L
         lifecycleScope.launch(Dispatchers.IO) {
             Log.d(TAG, "connect: start")
             val binData = contentResolver.openInputStream(mBinUri)?.use {
@@ -97,21 +103,51 @@ class BleOTAActivity : AppCompatActivity() {
         mOtaClient?.ota()
     }
 
-    private fun updateStatus(message: String, connected: Boolean, showProgress: Boolean = connected) {
+    /**
+     * @param deferBleRelease If true and [connected] is false, only updates UI now; [close] runs on the
+     * next UI frame so a prior line (e.g. "OTA Complete!!") is shown before disconnect callbacks append.
+     */
+    private fun updateStatus(
+        message: String,
+        connected: Boolean,
+        showProgress: Boolean = connected,
+        deferBleRelease: Boolean = false,
+    ) {
         runOnUiThread {
             mStatusList.add(message)
             mBinding.recyclerView.scrollToPosition(mStatusList.lastIndex)
             if (connected) {
                 mBinding.otaBtn.isEnabled = true
             } else {
-                close()
                 mBinding.otaBtn.isEnabled = false
+                if (deferBleRelease) {
+                    mBinding.root.post { close() }
+                } else {
+                    close()
+                }
             }
             if (showProgress) {
                 mBinding.progressBar.visible()
             } else {
                 mBinding.progressBar.gone()
             }
+        }
+    }
+
+    /** Append multiple status lines in one UI pass; same teardown as [updateStatus] with [connected] false. */
+    private fun appendStatusLines(lines: List<String>, deferBleRelease: Boolean) {
+        runOnUiThread {
+            for (line in lines) {
+                mStatusList.add(line)
+            }
+            mBinding.recyclerView.scrollToPosition(mStatusList.lastIndex)
+            mBinding.otaBtn.isEnabled = false
+            if (deferBleRelease) {
+                mBinding.root.post { close() }
+            } else {
+                close()
+            }
+            mBinding.progressBar.gone()
         }
     }
 
@@ -221,11 +257,28 @@ class BleOTAActivity : AppCompatActivity() {
         override fun onOTA(message: BleOTAMessage) {
             if (message is StartCommandAckMessage) {
                 if (message.status == CommandAckMessage.STATUS_ACCEPT) {
+                    mOtaXferStartElapsedMs = SystemClock.elapsedRealtime()
                     updateStatus("Start OTA ...", true)
                 }
             } else if (message is EndCommandAckMessage) {
                 if (message.status == CommandAckMessage.STATUS_ACCEPT) {
-                    updateStatus("OTA Complete!!", false)
+                    val bytes = mOtaClient?.firmwareSizeBytes ?: 0
+                    val startMs = mOtaXferStartElapsedMs
+                    mOtaXferStartElapsedMs = 0L
+                    val elapsedMs =
+                        if (startMs > 0L) (SystemClock.elapsedRealtime() - startMs).coerceAtLeast(1L)
+                        else 1L
+                    val elapsedSec = elapsedMs / 1000.0
+                    val kibPerS = if (elapsedSec > 0.0) (bytes / 1024.0) / elapsedSec else 0.0
+                    val rateLine = String.format(
+                        Locale.US,
+                        "avg %.2f KiB/s (%d bytes, %.2f s)",
+                        kibPerS,
+                        bytes,
+                        elapsedSec,
+                    )
+                    Log.i(TAG, rateLine)
+                    appendStatusLines(listOf("OTA Complete!!", rateLine), deferBleRelease = true)
                 }
             }
         }

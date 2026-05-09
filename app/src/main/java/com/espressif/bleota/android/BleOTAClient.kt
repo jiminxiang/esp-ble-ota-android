@@ -28,6 +28,9 @@ class BleOTAClient(
     private val bin: ByteArray,
 ) : Closeable {
 
+    /** Whole image size in bytes (for UI throughput stats). */
+    val firmwareSizeBytes: Int get() = bin.size
+
     private val manager = EspBleOtaBleManager(context, this)
 
     companion object {

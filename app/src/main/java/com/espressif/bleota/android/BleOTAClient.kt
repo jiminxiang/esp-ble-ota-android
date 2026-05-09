@@ -63,8 +63,11 @@ class BleOTAClient(
         internal val CHAR_COMMAND_UUID = bleUUID("8022")
         internal val CHAR_CUSTOMER_UUID = bleUUID("8023")
 
-        /** Max sectors sent ahead without receiving per-sector notify ACK. */
-        private const val SECTOR_SEND_WINDOW = 3
+        /** Pipeline depth when START ACK byte 6 is zero (legacy peripheral without window field). */
+        private const val LEGACY_DEFAULT_SECTOR_SEND_WINDOW = 2
+
+        private const val MIN_SECTOR_SEND_WINDOW = 1
+        private const val MAX_SECTOR_SEND_WINDOW = 64
 
         internal fun bleDebugLog(): Boolean = DEBUG
     }
@@ -86,6 +89,9 @@ class BleOTAClient(
 
     /** Sectors fully written (past [sectorAckMark]) but not yet released by BIN_ACK_SUCCESS. */
     private var sectorsInFlight: Int = 0
+
+    /** From START ACK byte 6; fallback [LEGACY_DEFAULT_SECTOR_SEND_WINDOW] if zero. */
+    private var sectorSendWindow: Int = LEGACY_DEFAULT_SECTOR_SEND_WINDOW
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var binTransferActive = false
@@ -116,6 +122,7 @@ class BleOTAClient(
         sectorsInFlight = 0
         packets.clear()
         consecutiveIndexErrResyncCount.set(0)
+        sectorSendWindow = LEGACY_DEFAULT_SECTOR_SEND_WINDOW
         service = null
         recvFwChar = null
         progressChar = null
@@ -295,13 +302,19 @@ class BleOTAClient(
         manager.enqueueCommandWrite(packet)
     }
 
-    private fun receiveCommandStartAck(status: Int) {
-        Log.i(TAG, "receiveCommandStartAck: status=$status")
+    private fun receiveCommandStartAck(status: Int, sendWindowByte: Int) {
         when (status) {
             COMMAND_ACK_ACCEPT -> {
+                sectorSendWindow = when {
+                    sendWindowByte > 0 ->
+                        sendWindowByte.coerceIn(MIN_SECTOR_SEND_WINDOW, MAX_SECTOR_SEND_WINDOW)
+                    else -> LEGACY_DEFAULT_SECTOR_SEND_WINDOW
+                }
+                Log.i(TAG, "receiveCommandStartAck: status=$status sectorSendWindow=$sectorSendWindow")
                 postBinData()
             }
             COMMAND_ACK_REFUSE -> {
+                Log.i(TAG, "receiveCommandStartAck: status=$status")
                 callback?.onError(BleOTAErrors.START_REFUSED)
             }
         }
@@ -361,10 +374,10 @@ class BleOTAClient(
                 if (DEBUG) {
                     Log.d(TAG, "postNextPacket: has more packets, sectorsInFlight=$sectorsInFlight")
                 }
-                if (sectorsInFlight < SECTOR_SEND_WINDOW) {
+                if (sectorsInFlight < sectorSendWindow) {
                     postNextPacket()
                 } else {
-                    Log.d(TAG, "postNextPacket: sectors in flight >= SECTOR_SEND_WINDOW, wait for ACK")
+                    Log.d(TAG, "postNextPacket: sectors in flight >= $sectorSendWindow, wait for ACK")
                 }
             }
             return
@@ -497,9 +510,10 @@ class BleOTAClient(
         }
         val ackId = u16le(packet, 2)
         val ackStatus = u16le(packet, 4)
+        val sendWindowByte = packet[6].toInt() and 0xff
         when (ackId) {
             COMMAND_ID_START -> {
-                receiveCommandStartAck(ackStatus)
+                receiveCommandStartAck(ackStatus, sendWindowByte)
             }
             COMMAND_ID_END -> {
                 receiveCommandEndAck(ackStatus)

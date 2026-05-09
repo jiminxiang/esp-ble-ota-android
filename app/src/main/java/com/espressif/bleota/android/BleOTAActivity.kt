@@ -1,6 +1,9 @@
 package com.espressif.bleota.android
 
 import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.le.ScanResult
 import android.net.Uri
 import android.os.Build
@@ -143,6 +146,7 @@ class BleOTAActivity : AppCompatActivity() {
         }
 
         override fun onDeviceDisconnected(device: BluetoothDevice, reason: Int) {
+            super.onDeviceDisconnected(device, reason)
             val human = when (reason) {
                 ConnectionObserver.REASON_SUCCESS -> "local disconnect"
                 ConnectionObserver.REASON_TERMINATE_PEER_USER -> "peer disconnected"
@@ -188,26 +192,50 @@ class BleOTAActivity : AppCompatActivity() {
             updateStatus("Discover service and char completed", true, false)
         }
 
+        override fun onDescriptorWrite(
+            gatt: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int
+        ) {
+            super.onDescriptorWrite(gatt, descriptor, status)
+            if (isGattFailed(status)) {
+                updateStatus(
+                    "Set notification enabled failed, status=$status, char=${descriptor.characteristic.uuid}",
+                    false
+                )
+                return
+            }
+        }
+
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            super.onCharacteristicWrite(gatt, characteristic, status)
+            if (isGattFailed(status) && characteristic != mOtaClient?.recvFwChar) {
+                updateStatus("CharacteristicWrite failed, status=$status", false)
+            }
+        }
+
         override fun onOTA(message: BleOTAMessage) {
             if (message is StartCommandAckMessage) {
                 if (message.status == CommandAckMessage.STATUS_ACCEPT) {
                     updateStatus("Start OTA ...", true)
-                } else {
-                    if (message.status == CommandAckMessage.STATUS_REFUSE) {
-                        updateStatus("Device refuse OTA start request", false)
-                    }
                 }
             } else if (message is EndCommandAckMessage) {
                 if (message.status == CommandAckMessage.STATUS_ACCEPT) {
                     updateStatus("OTA Complete!!", false)
-                } else if (message.status == CommandAckMessage.STATUS_REFUSE) {
-                    updateStatus("Device refuse OTA end request", false)
                 }
             }
         }
 
+        override fun onSectorIndexResync(fromSector: Int) {
+            updateStatus("Sector index resync: resend from sector $fromSector", true, false)
+        }
+
         override fun onError(code: Int) {
-            updateStatus("Error: $code", false)
+            updateStatus(BleOTAErrors.messageFor(code), false)
         }
     }
 }

@@ -1,5 +1,6 @@
 package com.espressif.bleota.android
 
+import android.bluetooth.BluetoothGatt
 import android.app.Activity
 import android.content.Context
 import android.content.pm.PackageManager
@@ -49,6 +50,10 @@ fun View.gone() {
 fun bleUUID(uuid: String): UUID {
     return UUID.fromString("0000$uuid-0000-1000-8000-00805f9b34fb")
 }
+
+fun isGattSuccess(status: Int): Boolean = status == BluetoothGatt.GATT_SUCCESS
+
+fun isGattFailed(status: Int): Boolean = status != BluetoothGatt.GATT_SUCCESS
 
 fun <K, V> LinkedHashMap<K, V>.getByIndex(index: Int): MutableMap.MutableEntry<K, V> {
     if (index < 0 || index >= size) {

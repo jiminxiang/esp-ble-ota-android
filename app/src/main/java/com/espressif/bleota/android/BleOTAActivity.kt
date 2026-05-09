@@ -103,15 +103,10 @@ class BleOTAActivity : AppCompatActivity() {
         mOtaClient?.ota()
     }
 
-    /**
-     * @param deferBleRelease If true and [connected] is false, only updates UI now; [close] runs on the
-     * next UI frame so a prior line (e.g. "OTA Complete!!") is shown before disconnect callbacks append.
-     */
     private fun updateStatus(
         message: String,
         connected: Boolean,
         showProgress: Boolean = connected,
-        deferBleRelease: Boolean = false,
     ) {
         runOnUiThread {
             mStatusList.add(message)
@@ -120,11 +115,7 @@ class BleOTAActivity : AppCompatActivity() {
                 mBinding.otaBtn.isEnabled = true
             } else {
                 mBinding.otaBtn.isEnabled = false
-                if (deferBleRelease) {
-                    mBinding.root.post { close() }
-                } else {
-                    close()
-                }
+                close()
             }
             if (showProgress) {
                 mBinding.progressBar.visible()
@@ -134,17 +125,18 @@ class BleOTAActivity : AppCompatActivity() {
         }
     }
 
-    /** Append multiple status lines in one UI pass; same teardown as [updateStatus] with [connected] false. */
-    private fun appendStatusLines(lines: List<String>, deferBleRelease: Boolean) {
+    /**
+     * Append multiple status lines in one UI pass. If [releaseBle] is false, keeps GATT connected
+     * (e.g. after OTA success while waiting for peer reset).
+     */
+    private fun appendStatusLines(lines: List<String>, releaseBle: Boolean) {
         runOnUiThread {
             for (line in lines) {
                 mStatusList.add(line)
             }
             mBinding.recyclerView.scrollToPosition(mStatusList.lastIndex)
             mBinding.otaBtn.isEnabled = false
-            if (deferBleRelease) {
-                mBinding.root.post { close() }
-            } else {
+            if (releaseBle) {
                 close()
             }
             mBinding.progressBar.gone()
@@ -278,7 +270,7 @@ class BleOTAActivity : AppCompatActivity() {
                         elapsedSec,
                     )
                     Log.i(TAG, rateLine)
-                    appendStatusLines(listOf("OTA Complete!!", rateLine), deferBleRelease = true)
+                    appendStatusLines(listOf("OTA Complete!!", rateLine), releaseBle = false)
                 }
             }
         }
